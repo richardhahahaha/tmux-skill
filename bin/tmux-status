@@ -1,0 +1,139 @@
+#!/bin/bash
+# tmux-status — print a clean, structured overview of tmux sessions/panes.
+#
+# Outputs to a file first (not stdout) to avoid the multi-line shell mangling
+# issue when piping through tail/grep inside Claude Code's Bash tool.
+#
+# USAGE
+#   tmux-status                  # all sessions
+#   tmux-status <session>        # one session's windows/panes
+#   tmux-status <session> --tail N   # also show last N lines of each pane
+#   tmux-status --procs          # include matching python/bash processes
+#   tmux-status --out <file>     # write to file (default: /tmp/tmux-status.txt)
+#
+set -euo pipefail
+
+SESSION=""
+TAIL=0
+PROCS=0
+OUT="/tmp/tmux-status.txt"
+NOT_FOUND=0
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+# Strip obvious shell redirect residue (Claude Code's Bash tool sometimes
+# passes trailing tokens like `2`, `&`, `>`, `2>&1` as separate argv items
+# when the original command had a redirect like `> /tmp/out 2>&1`).
+is_redirect_residue() {
+    case "$1" in
+        '2>&1'|'>&1'|'&>'|'>'|'<'|'1>'|'2>'|'&') return 0;;
+        '|'*|'||'*|'&&'*) return 0;;
+        '') return 0;;
+    esac
+    return 1
+}
+
+CLEAN_ARGS=()
+for a in "$@"; do
+    if is_redirect_residue "$a"; then continue; fi
+    CLEAN_ARGS+=("$a")
+done
+set -- "${CLEAN_ARGS[@]}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tail)  [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --tail requires a numeric value" >&2; exit 2; }
+                 TAIL="$2"
+                 [[ "$TAIL" =~ ^[0-9]+$ ]] || { echo "ERROR: --tail must be a non-negative integer, got '$TAIL'" >&2; exit 2; }
+                 shift 2;;
+        --procs) PROCS=1; shift;;
+        --out)   [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --out requires a path value" >&2; exit 2; }
+                 OUT="$2"; shift 2;;
+        --help|-h) usage;;
+        -*|--)   shift;;
+        *)
+            # Only set SESSION once; ignore later positional args.
+            # Also reject bare "1"/"2" — these come from leaked "2>&1" residue
+            # from the Bash tool. Real session names are alphanumeric.
+            if [[ -z "$SESSION" && ! "$1" =~ ^[12]$ ]]; then SESSION="$1"; fi
+            shift
+            ;;
+    esac
+done
+
+{
+    echo "=== TMUX STATUS @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo ""
+
+    if [[ -z "$SESSION" ]]; then
+        echo "[ SESSIONS ]"
+        tmux ls 2>/dev/null || echo "(no tmux sessions)"
+        SESSIONS=($(tmux ls -F '#{session_name}' 2>/dev/null || echo ""))
+    else
+        SESSIONS=("$SESSION")
+    fi
+
+    for s in "${SESSIONS[@]:-}"; do
+        [[ -z "$s" ]] && continue
+        echo ""
+        echo "=== SESSION: $s ==="
+        if ! tmux has-session -t "$s" 2>/dev/null; then
+            echo "  (not found)"
+            NOT_FOUND=1
+            continue
+        fi
+        # List windows
+        echo "[ WINDOWS ]"
+        tmux list-windows -t "$s" -F '  #{window_index}: #{window_name} (#{window_panes} panes, #{?window_active,ACTIVE,})' 2>/dev/null || true
+
+        # For each window, list panes (use window INDEX, not name — name can
+        # contain spaces or collide with the session:window.target syntax)
+        echo "[ PANES ]"
+        # Read "index\tname" pairs into arrays (avoid `for x in $(...)` which
+        # breaks on spaces in window names and silently aborts under set -e).
+        WIN_INDICES=()
+        WIN_NAMES=()
+        while IFS=$'\t' read -r idx name; do
+            [[ -z "$idx" ]] && continue
+            WIN_INDICES+=("$idx")
+            WIN_NAMES+=("$name")
+        done < <(tmux list-windows -t "$s" -F '#{window_index}	#{window_name}' 2>/dev/null || true)
+
+        for i in "${!WIN_INDICES[@]}"; do
+            idx="${WIN_INDICES[$i]}"
+            w="${WIN_NAMES[$i]}"
+            target="$s:$idx"
+            PANE_COUNT=$(tmux list-panes -t "$target" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+            if [[ "$PANE_COUNT" -le 1 ]]; then
+                # Single-pane window: capture directly
+                LAST_LINE=$(tmux capture-pane -t "$target" -p 2>/dev/null | grep -vE '^\s*$' | tail -n 1 || true)
+                printf '  %s/%-15s %s\n' "$idx" "$w" "${LAST_LINE:0:120}"
+                if [[ "$TAIL" -gt 0 ]]; then
+                    tmux capture-pane -t "$target" -p -S -"$TAIL" 2>/dev/null \
+                        | grep -vE '^\s*$' | tail -n "$TAIL" | sed 's/^/      | /' || true
+                fi
+            else
+                echo "  $idx/$w:"
+                tmux list-panes -t "$target" -F '    pane=#{pane_index} #{pane_current_command} #{pane_pid}' 2>/dev/null || true
+            fi
+        done
+    done
+
+    if [[ "$PROCS" == "1" ]]; then
+        echo ""
+        echo "[ MATCHING PROCESSES ]"
+        ps -eo pid,etime,pcpu,args \
+            | grep -E 'python|clsTrainer\.py|palm_train\.sh|palm_det_train\.sh|tmux_scheduler\.py|web_monitor\.py|auto_monitor\.py' \
+            | grep -v grep || echo "(none)"
+    fi
+
+    echo ""
+    echo "=== END ==="
+} > "$OUT"
+
+cat "$OUT"
+echo ""
+echo "(written to $OUT)"
+
+# Exit non-zero if a requested session was not found (useful for scripts).
+[[ "$NOT_FOUND" == "0" ]] || exit 3

@@ -1,0 +1,200 @@
+#!/bin/bash
+# tmux-exec — atomically run a command in a tmux pane.
+#
+# WHY THIS EXISTS
+#   Claude Code's Bash tool occasionally mangles multi-line / quoted commands
+#   when they are fed through `tmux send-keys`. The target pane's shell ends
+#   up running garbage like "sleep5tmuxsend-keys...". Two specific bugs:
+#     (a) `printf '%q'` quoting produced `python\ foo.py` literal backslashes
+#         when pasted via paste-buffer  (FIX: use plain "${CMD_ARGS[*]}")
+#     (b) A trailing `2>&1` from the Bash tool's own invocation sometimes
+#         leaked into CMD_ARGS, producing `python foo.py 2` in the pane
+#         (FIX: strip obvious shell-redirect residue before sending)
+#
+# CORE DESIGN
+#   1. Build CMD_STR (joined args, with redirect residue stripped).
+#   2. Write CMD_STR + "\n" to a temp file.
+#   3. load-buffer + paste-buffer ONCE. The newline at end triggers shell
+#      execution. No `send-keys Enter` — that second send was the source
+#      of interleaving bugs.
+#   4. Before paste, atomic prompt clear: C-c, C-u, Enter, C-u.
+#
+# USAGE
+#   tmux-exec <target> <command...>
+#   tmux-exec <target> --file <path>
+#   tmux-exec <target> --stdin
+#
+# OPTIONS
+#   --no-clear        Skip the prompt-clearing dance (risky)
+#   --cwd <dir>       cd into <dir> before running the command
+#   --bg              Don't wait / don't capture output after sending
+#   --wait <sec>      Seconds to wait before capturing (default: 3)
+#   --lines <n>       Number of lines to capture (default: 20)
+#   --dry-run         Print what would be sent, do not actually send
+#
+# EXAMPLES
+#   tmux-exec palm_training_agent:scheduler 'python tmux_scheduler.py --loop --interval 60'
+#   tmux-exec palm_training_agent:scheduler --dry-run -- python tmux_scheduler.py --loop
+#
+set -euo pipefail
+
+WAIT_SEC=3
+LINES=20
+NO_CLEAR=0
+BG=0
+DRY_RUN=0
+CWD=""
+TARGET=""
+CMD_MODE="args"   # args | file | stdin
+CMD_FILE=""
+CMD_ARGS=()
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-clear) NO_CLEAR=1; shift;;
+        --bg)       BG=1; shift;;
+        --dry-run)  DRY_RUN=1; shift;;
+        --cwd)      [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --cwd requires a path value" >&2; exit 2; }
+                    CWD="$2"; shift 2;;
+        --wait)     [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --wait requires a numeric value" >&2; exit 2; }
+                    WAIT_SEC="$2"
+                    [[ "$WAIT_SEC" =~ ^[0-9]+$ ]] || { echo "ERROR: --wait must be a non-negative integer, got '$WAIT_SEC'" >&2; exit 2; }
+                    shift 2;;
+        --lines)    [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --lines requires a numeric value" >&2; exit 2; }
+                    LINES="$2"
+                    [[ "$LINES" =~ ^[0-9]+$ ]] || { echo "ERROR: --lines must be a non-negative integer, got '$LINES'" >&2; exit 2; }
+                    shift 2;;
+        --file)     [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --file requires a path value" >&2; exit 2; }
+                    CMD_MODE="file"; CMD_FILE="$2"; shift 2;;
+        --stdin)    CMD_MODE="stdin"; shift;;
+        --help|-h)  usage;;
+        --)         shift; while [[ $# -gt 0 ]]; do CMD_ARGS+=("$1"); shift; done;;
+        -*)
+            # Unknown flag. Before TARGET: eat it (likely redirect residue
+            # like 2>&1 leaked from Bash tool). After TARGET: it belongs to
+                    # the user's command (e.g. `python -c`, `grep -E`), so add
+                    # it to CMD_ARGS instead of discarding.
+            if [[ -n "$TARGET" && "$CMD_MODE" == "args" ]]; then
+                CMD_ARGS+=("$1"); shift;
+            else
+                shift;
+            fi
+            ;;
+        *)
+            # Reject bare "1"/"2" as TARGET — they leak from "2>&1" residue.
+            # Real tmux targets are session:window.pane names, never "1" or "2".
+            if [[ -z "$TARGET" && ! "$1" =~ ^[12]$ ]]; then TARGET="$1"; shift;
+            elif [[ "$CMD_MODE" == "args" ]]; then CMD_ARGS+=("$1"); shift;
+            else shift; fi   # ignore extra positionals silently
+            ;;
+    esac
+done
+
+[[ -n "$TARGET" ]] || { echo "ERROR: target required" >&2; exit 2; }
+if ! tmux has-session -t "${TARGET%%:*}" 2>/dev/null && ! tmux list-panes -t "$TARGET" >/dev/null 2>&1; then
+    echo "ERROR: tmux target '$TARGET' not found" >&2
+    tmux ls >&2 || true
+    exit 3
+fi
+
+# ── Resolve command into a single string ──────────────────────────────────
+case "$CMD_MODE" in
+    args)
+        [[ ${#CMD_ARGS[@]} -gt 0 ]] || { echo "ERROR: command required" >&2; exit 2; }
+        # Strip obvious shell-redirect residue that may have leaked from the
+        # Bash tool's own invocation. Patterns we drop:
+        #   2>&1   2>file   &>file   1>file   > file   |   ||   &&  at start
+        #   bare "2", "1", "&", ">" tokens
+        CLEAN_ARGS=()
+        for a in "${CMD_ARGS[@]}"; do
+            # Strip shell-redirect residue that may have leaked from the Bash
+            # tool's own invocation. NOTE: backslash-escape every shell-special
+            # char in patterns, including the trailing '&' which bash would
+            # otherwise parse as the '|&' pipe-stderr operator.
+            case "$a" in
+                '2>&1'|'>'|'1>'|'2>'|'&>')      continue;;             # bare redirect op
+                *'>&1'|*'>file'|*'>'.*)         a="${a%%>*}";;          # cmd>something
+                '|'*|'||'*|'&&'*)              continue;;              # pipe/and/or
+                '&')                           continue;;
+            esac
+            [[ -z "$a" ]] && continue
+            CLEAN_ARGS+=("$a")
+        done
+        # Strip trailing bare "1"/"2" tokens (leaked from "2>&1" residue).
+        # Legitimate numeric args like "--interval 60" appear in the middle,
+        # residue always lands at the tail.
+        while [[ ${#CLEAN_ARGS[@]} -gt 0 && "${CLEAN_ARGS[-1]}" =~ ^[12]$ ]]; do
+            unset 'CLEAN_ARGS[-1]'
+        done
+        if [[ ${#CLEAN_ARGS[@]} -eq 0 ]]; then
+            echo "ERROR: command empty after stripping redirect residue" >&2
+            exit 2
+        fi
+        CMD_STR="${CLEAN_ARGS[*]}"
+        ;;
+    file)
+        [[ -n "$CMD_FILE" && -f "$CMD_FILE" ]] || { echo "ERROR: file not found: $CMD_FILE" >&2; exit 2; }
+        CMD_STR="$(cat "$CMD_FILE")"
+        ;;
+    stdin)
+        CMD_STR="$(cat)"
+        ;;
+esac
+
+[[ -n "$CMD_STR" ]] || { echo "ERROR: empty command" >&2; exit 2; }
+
+# Prefix with cd if requested
+if [[ -n "$CWD" ]]; then
+    if [[ "$CWD" == *" "* ]]; then
+        CMD_STR="cd \"$CWD\" && $CMD_STR"
+    else
+        CMD_STR="cd $CWD && $CMD_STR"
+    fi
+fi
+
+# ── Dry run ──────────────────────────────────────────────────────────────
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] target: $TARGET"
+    echo "[dry-run] cwd:    ${CWD:-(none)}"
+    echo "[dry-run] clear:  $([[ "$NO_CLEAR" == "0" ]] && echo yes || echo no)"
+    echo "[dry-run] command:"
+    printf '%s\n' "$CMD_STR" | sed 's/^/    | /'
+    exit 0
+fi
+
+# ── Atomic prompt clear ──────────────────────────────────────────────────
+if [[ "$NO_CLEAR" == "0" ]]; then
+    tmux send-keys -t "$TARGET" C-c
+    sleep 0.3
+    tmux send-keys -t "$TARGET" C-u
+    tmux send-keys -t "$TARGET" Enter
+    sleep 0.3
+    tmux send-keys -t "$TARGET" C-u
+    sleep 0.2
+fi
+
+# ── Atomic paste: command + newline in a single buffer ───────────────────
+# This is the heart of the fix. We include "\n" at end of the buffer so the
+# shell executes immediately on paste — no separate send-keys Enter needed.
+TMPBUF="$(mktemp)"
+printf '%s\n' "$CMD_STR" > "$TMPBUF"
+tmux load-buffer -b tmux-exec-cmd "$TMPBUF"
+rm -f "$TMPBUF"
+
+tmux paste-buffer -t "$TARGET" -b tmux-exec-cmd -d
+# (No send-keys Enter — the newline inside the buffer already triggered it.)
+
+if [[ "$BG" == "1" ]]; then
+    echo "sent (background)"
+    exit 0
+fi
+
+sleep "$WAIT_SEC"
+
+# Capture pane output to a tmpfile (NOT stdout) to avoid re-piping issues
+OUT="$(mktemp)"
+tmux capture-pane -t "$TARGET" -p -S -"$LINES" > "$OUT"
+cat "$OUT"
+rm -f "$OUT"

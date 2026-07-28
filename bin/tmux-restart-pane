@@ -1,0 +1,287 @@
+#!/bin/bash
+# tmux-restart-pane — safely stop a long-running process in a tmux pane
+# and restart it with a new command, WITHOUT touching other panes.
+#
+# WHY THIS EXISTS
+#   When 3 trainings are running on GPUs and you need to restart only the
+#   scheduler pane (e.g. to pick up code changes), you can't use `--stop`
+#   which kills the whole tmux session. This script:
+#     1. Snapshots each --verify pane's process tree (via pane_pid + pgrep)
+#     2. Sends C-c to the target pane only
+#     3. Waits for the python process to actually die
+#     4. Sends the new command via tmux-exec (atomic paste, no mangling)
+#     5. Re-snapshots each --verify pane and reports ANY descendant that died
+#
+# DETECTION MECHANISM
+#   Previous version used a md5sum hash of the pane's last 3 lines. This had
+#   two failure modes:
+#     (a) Frozen process (e.g. hung GPU driver) still produces log lines from
+#         a different thread → hash changes → false "alive"
+#     (b) Idle shell prompt → hash stable → false "dead" if pane was just
+#         waiting for input
+#   New version walks the process tree from tmux's #{pane_pid} using ps,
+#   so it knows EXACTLY which pids are children of the pane shell.
+#
+# USAGE
+#   tmux-restart-pane <target> [--cwd <dir>] -- <command...>
+#   tmux-restart-pane <target> --verify <protected-target> -- <command...>
+#
+# EXAMPLES
+#   # Restart scheduler in place
+#   tmux-restart-pane palm_training_agent:scheduler -- \
+#       python tmux_scheduler.py --loop --interval 60
+#
+#   # Restart monitor, verify GPU panes still alive afterward
+#   tmux-restart-pane palm_training_agent:monitor \
+#       --verify palm_training_agent:gpu0 \
+#       --verify palm_training_agent:gpu1 \
+#       --verify palm_training_agent:gpu4 -- \
+#       python tmux_scheduler.py --monitor-loop
+#
+# EXIT CODES
+#   0  Success
+#   2  Usage error
+#   3  Target tmux session/pane not found
+#   4  A protected pane had descendant processes die during restart (WARNING)
+#   5  Target process did not stop after C-c
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET=""
+CWD=""
+VERIFY_PANES=()
+CMD=()
+DRY_RUN=0
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+# Strip obvious shell redirect residue (Claude Code's Bash tool sometimes
+# passes trailing tokens like `2`, `&`, `>`, `2>&1` as separate argv items).
+is_redirect_residue() {
+    case "$1" in
+        '2>&1'|'>&1'|'&>'|'>'|'<'|'1>'|'2>'|'&') return 0;;
+        '|'*|'||'*|'&&'*) return 0;;
+        '') return 0;;
+    esac
+    return 1
+}
+
+CLEAN_ARGS=()
+for a in "$@"; do
+    if is_redirect_residue "$a"; then continue; fi
+    CLEAN_ARGS+=("$a")
+done
+set -- "${CLEAN_ARGS[@]}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cwd)     [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --cwd requires a path value" >&2; exit 2; }
+                   CWD="$2"; shift 2;;
+        --verify)  [[ $# -ge 2 && "$2" != -* ]] || { echo "ERROR: --verify requires a pane target value" >&2; exit 2; }
+                   VERIFY_PANES+=("$2"); shift 2;;
+        --dry-run) DRY_RUN=1; shift;;
+        --help|-h) usage;;
+        --)        shift;
+                   while [[ $# -gt 0 ]]; do
+                       if is_redirect_residue "$1"; then shift; continue; fi
+                       CMD+=("$1"); shift
+                   done;;
+        -*|--)     shift;;   # ignore unknown flags
+        *)
+            # Reject bare "1"/"2" as TARGET (leaked from "2>&1" residue).
+            if [[ -z "$TARGET" && ! "$1" =~ ^[12]$ ]]; then TARGET="$1"; shift;
+            else shift; fi
+            ;;
+    esac
+done
+
+[[ -n "$TARGET" ]] || { echo "ERROR: target required" >&2; exit 2; }
+[[ ${#CMD[@]} -gt 0 ]] || { echo "ERROR: command required (after --)" >&2; exit 2; }
+
+# Strip trailing bare "1"/"2" tokens from CMD (leaked from "2>&1" residue).
+# We only strip from the END since legitimate numeric args like "--interval 60"
+# appear in the middle, while residue always lands at the tail.
+while [[ ${#CMD[@]} -gt 0 && "${CMD[-1]}" =~ ^[12]$ ]]; do
+    unset 'CMD[-1]'
+done
+[[ ${#CMD[@]} -gt 0 ]] || { echo "ERROR: command empty after stripping redirect residue" >&2; exit 2; }
+
+if ! tmux has-session -t "${TARGET%%:*}" 2>/dev/null && ! tmux list-panes -t "$TARGET" >/dev/null 2>&1; then
+    echo "ERROR: tmux target '$TARGET' not found" >&2
+    exit 3
+fi
+
+# ── Helper: list descendant pids of a pane ────────────────────────────────
+# Walks the process tree from the pane's shell pid, recursively.
+# Prints: "<pid> <etime> <args...>" one per line.
+#
+# We pass the ps output via a temporary file (not stdin) because the python
+# script itself is fed via heredoc — combining heredoc with piped stdin in
+# bash command substitution $(...) loses one of them.
+descendants_of_pane() {
+    local pane_target="$1"
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$pane_target" -F '#{pane_pid}' 2>/dev/null | head -1)
+    [[ -n "$pane_pid" ]] || return 0
+
+    local psfile
+    psfile=$(mktemp)
+    ps -eo pid,ppid,etime,args > "$psfile" 2>/dev/null
+
+    python3 - "$pane_pid" "$psfile" <<'PYEOF'
+import sys
+root = int(sys.argv[1])
+psfile = sys.argv[2]
+children = {}
+with open(psfile) as f:
+    for line in f:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append((pid, parts[2], parts[3].rstrip()))
+
+queue = [root]
+seen = set()
+while queue:
+    cur = queue.pop(0)
+    if cur in seen:
+        continue
+    seen.add(cur)
+    for pid, etime, args in children.get(cur, []):
+        print(f"{pid} {etime} {args}")
+        queue.append(pid)
+PYEOF
+    rm -f "$psfile"
+}
+
+# ── Helper: format a list of "<pid> <etime> <args>" lines for display ────
+# (Currently inlined where used. Kept here as a placeholder for future use.)
+:
+
+echo "[restart-pane] target=$TARGET"
+
+# ── Pre-flight: snapshot each --verify pane's descendants ────────────────
+# We use parallel arrays (one entry per --verify pane) since mapfile can't
+# write to associative-array slots.
+VERIFY_KEYS=()
+declare -A BEFORE_PIDS
+declare -A BEFORE_OUTPUT
+for p in "${VERIFY_PANES[@]:-}"; do
+    [[ -z "$p" ]] && continue
+    if ! tmux list-panes -t "$p" >/dev/null 2>&1; then
+        echo "[restart-pane] WARNING: protected target '$p' not found — skipped"
+        continue
+    fi
+    VERIFY_KEYS+=("$p")
+    BEFORE_OUTPUT["$p"]="$(descendants_of_pane "$p")"
+    BEFORE_PIDS["$p"]=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        pid=$(echo "$line" | awk '{print $1}')
+        BEFORE_PIDS["$p"]+="$pid "
+    done <<< "${BEFORE_OUTPUT[$p]}"
+    echo "[restart-pane] protected $p (before):"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        echo "    ${line:0:140}$([[ ${#line} -gt 140 ]] && echo '...')"
+    done <<< "${BEFORE_OUTPUT[$p]}"
+done
+
+# ── Dry run: stop here ────────────────────────────────────────────────────
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo ""
+    echo "[restart-pane] DRY RUN — would send these to target:"
+    echo "  C-c, then tmux-exec with command:"
+    printf '  %s\n' "${CMD[*]}"
+    echo ""
+    echo "[restart-pane] DRY RUN — would verify these panes after restart:"
+    for p in "${VERIFY_PANES[@]:-}"; do
+        [[ -z "$p" ]] && continue
+        echo "  $p"
+    done
+    exit 0
+fi
+
+# ── Step 1: stop the running process in target pane ──────────────────────
+echo "[restart-pane] sending C-c..."
+tmux send-keys -t "$TARGET" C-c
+
+# Step 2: wait for the target pane's descendants to die
+DEAD=0
+for i in {1..20}; do
+    sleep 0.5
+    TARGET_DESCS=$(descendants_of_pane "$TARGET" || true)
+    if [[ -z "$TARGET_DESCS" ]]; then
+        DEAD=1
+        echo "[restart-pane] target pane has no more descendants (after ${i}x0.5s)"
+        break
+    fi
+done
+
+if [[ "$DEAD" != "1" ]]; then
+    echo "[restart-pane] WARNING: target still has running processes after 10s:"
+    echo "$TARGET_DESCS" | head -5 | sed 's/^/    /'
+    echo "[restart-pane] sending second C-c..."
+    tmux send-keys -t "$TARGET" C-c
+    sleep 2
+    TARGET_DESCS=$(descendants_of_pane "$TARGET" || true)
+    if [[ -n "$TARGET_DESCS" ]]; then
+        echo "[restart-pane] ERROR: target still running. Aborting restart."
+        exit 5
+    fi
+fi
+
+# Step 3: send the new command via tmux-exec (atomic paste)
+echo "[restart-pane] sending new command..."
+
+if [[ -n "$CWD" ]]; then
+    "$SCRIPT_DIR/tmux-exec" "$TARGET" --cwd "$CWD" --wait 5 --lines 15 "${CMD[@]}"
+else
+    "$SCRIPT_DIR/tmux-exec" "$TARGET" --wait 5 --lines 15 "${CMD[@]}"
+fi
+
+# Step 4: re-snapshot each --verify pane, compare pid sets
+if [[ ${#VERIFY_KEYS[@]} -gt 0 ]]; then
+    sleep 3
+    ALL_OK=1
+    for p in "${VERIFY_KEYS[@]}"; do
+        AFTER_OUT="$(descendants_of_pane "$p" || true)"
+        AFTER_PIDS=""
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            pid=$(echo "$line" | awk '{print $1}')
+            AFTER_PIDS+="$pid "
+        done <<< "$AFTER_OUT"
+        # Pids that were in BEFORE but not AFTER = died
+        DIED=""
+        for pid in ${BEFORE_PIDS[$p]:-}; do
+            if [[ "$AFTER_PIDS" != *"$pid"* ]]; then
+                DIED+="$pid "
+            fi
+        done
+        if [[ -n "$DIED" ]]; then
+            echo "[restart-pane] WARNING: $p — these pids died during restart:"
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                pid=$(echo "$line" | awk '{print $1}')
+                if [[ "$DIED" == *"$pid "* ]]; then
+                    echo "    $line"
+                fi
+            done <<< "${BEFORE_OUTPUT[$p]}"
+            ALL_OK=0
+        else
+            echo "[restart-pane] protected $p OK — all original pids still alive"
+        fi
+    done
+    if [[ "$ALL_OK" != "1" ]]; then
+        echo "[restart-pane] WARNING: some protected processes died. Inspect above."
+        exit 4
+    fi
+fi
+
+echo "[restart-pane] done"

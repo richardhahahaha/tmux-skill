@@ -1,0 +1,298 @@
+#!/bin/bash
+# check-tmux-destructive — pre-flight guard for tmux operations that would kill
+# processes the user wants to protect.
+#
+# Designed as a PreToolUse hook for Bash, OR callable directly.
+#
+# WHEN USED AS A HOOK
+#   Reads the bash command from Claude Code's hook input JSON (on stdin).
+#   Looks for patterns like `tmux kill-session`, `tmux kill-window`,
+#   `tmux_scheduler.py --stop`, etc.
+#   If matched, returns permissionDecision: "ask" with a warning that lists
+#   running TRAINING-like processes in each tmux session.
+#
+# WHEN CALLED DIRECTLY
+#   tmux-restart-pane and other helpers call this before doing anything.
+#
+# USAGE (hook)
+#   In ~/.claude/settings.json:
+#     "hooks": {
+#       "PreToolUse": [{
+#         "matcher": "Bash",
+#         "hooks": [{
+#           "type": "command",
+#           "command": "~/.claude/skills/tmux-control/bin/check-tmux-destructive"
+#         }]
+#       }]
+#     }
+#
+# USAGE (direct)
+#   check-tmux-destructive "python tmux_scheduler.py --stop"
+#   check-tmux-destructive --session palm_training_agent "rm -rf logs/"
+#
+# PERFORMANCE NOTES
+#   We only emit TRAINING-like processes (clsTrainer, palm_train.sh,
+#   tmux_scheduler.py, palm_det_train.sh, etc.) — NOT every long-running
+#   descendant. This keeps the warning compact even when session `0` contains
+#   the user's dev shell with Claude Code, happy, node, MCP servers, etc.
+#   We also collapse duplicate worker processes from the same parent (e.g.
+#   python -m zlearning.clsTrainer workers forked by the same trainer).
+#
+set -euo pipefail
+
+# Patterns that destroy entire tmux sessions, windows, or kill panes.
+# Flag any `tmux kill-session/server/window/pane` invocation. (We accept rare
+# false positives on `--help`; safer to over-warn than miss a real kill.)
+DESTRUCTIVE_RE='tmux\s+kill-(session|server|window|pane)\b|tmux_scheduler\.py\s+--stop\b'
+
+# Patterns identifying training-related processes (the user's actual concern)
+TRAINING_RE='clsTrainer|palm_train\.sh|palm_det_train\.sh|tmux_scheduler\.py|train\.py|DetTrainer'
+
+# ── Helper: strip obvious shell redirect residue from args ────────────────
+# Claude Code's Bash tool sometimes passes trailing tokens like `2`, `&`,
+# `>`, `2>&1` as separate argv items when the original command had a redirect
+# like `> /tmp/out 2>&1`. Strip these so we don't produce a misleading CMD.
+strip_redirect_residue() {
+    local out=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            '2>&1'|'>&1'|'&>'|'>'|'<'|'1>'|'2>'|'&') continue;;
+            '|'*|'||'*|'&&'*) continue;;
+            '') continue;;
+        esac
+        [[ -z "$a" ]] && continue
+        out+=("$a")
+    done
+    printf '%s\n' "${out[*]}"
+}
+
+# ── Helper: walk process tree from a pane's shell pid ────────────────────
+# Prints "<pid> <etime> <args>" lines for each descendant (recursive).
+# We pass ps output via a temporary file (not stdin) because the python
+# script itself is fed via heredoc — combining heredoc with piped stdin in
+# bash command substitution $(...) loses one of them.
+session_descendants() {
+    local session="$1"
+    local psfile
+    psfile=$(mktemp)
+    ps -eo pid,ppid,etime,args > "$psfile" 2>/dev/null
+
+    # tmux list-panes -a returns panes from ALL sessions. -s -t <session>
+    # is supposed to be session-scoped but in some tmux versions still pulls
+    # global. Use -a with format "#{session_name} #{pane_pid}" and filter
+    # by session ourselves for reliability.
+    local pane_lines
+    pane_lines=$(tmux list-panes -a -F "#{session_name} #{pane_pid}" 2>/dev/null)
+    local pane_pids
+    pane_pids=$(echo "$pane_lines" | awk -v s="$session" '$1 == s {print $2}')
+
+    python3 - "$psfile" $pane_pids <<'PYEOF'
+import sys
+import re
+
+psfile = sys.argv[1]
+roots = [int(x) for x in sys.argv[2:] if x.strip()]
+
+children = {}
+pid_to_info = {}
+with open(psfile) as f:
+    for line in f:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        etime, args = parts[2], parts[3].rstrip()
+        children.setdefault(ppid, []).append(pid)
+        pid_to_info[pid] = (etime, args)
+
+# BFS walk
+queue = list(roots)
+seen = set()
+while queue:
+    cur = queue.pop(0)
+    if cur in seen:
+        continue
+    seen.add(cur)
+    for pid in children.get(cur, []):
+        etime, args = pid_to_info.get(pid, ("?", ""))
+        print(f"{pid} {etime} {args}")
+        queue.append(pid)
+PYEOF
+    rm -f "$psfile"
+}
+
+# ── Helper: format a single training process line for the warning ────────
+# Truncate the (often huge) command line intelligently:
+#   - python -m zlearning.clsTrainer --train-sample ... --name opt_0727_111117_gpu1 --backbone ...
+# becomes roughly:
+#   python -m zlearning.clsTrainer ... [opt_0727_111117_gpu1] (55:43)
+# We do this in python for clarity.
+# Note: takes input via argv-passed temp file path, NOT stdin (heredoc+pipe
+# conflict — same lesson as session_descendants above).
+format_training_summary() {
+    local infile="$1"
+    python3 - "$infile" <<'PYEOF'
+import sys
+import re
+from collections import OrderedDict
+
+infile = sys.argv[1]
+with open(infile) as f:
+    lines = f.readlines()
+
+# Collapse identical command lines (e.g. 4 dataloader workers per trainer
+# all show the same args). Keep first pid + etime, append "+N" suffix.
+groups = OrderedDict()  # key: summary string -> (first_pid, first_etime, count)
+for line in lines:
+    line = line.rstrip()
+    if not line:
+        continue
+    parts = line.split(None, 2)
+    if len(parts) < 3:
+        continue
+    pid, etime, args = parts
+    # Use the LAST --name occurrence: palm_train.sh appends the experiment
+    # name after the trainer's default --name palm, so the last one is the
+    # actual experiment identifier.
+    names = re.findall(r'--name\s+(\S+)', args)
+    name = names[-1] if names else ""
+    head = " ".join(args.split()[:4])
+    if name:
+        summary = f"{head} ... [{name}]"
+    else:
+        summary = args[:120] + ("..." if len(args) > 120 else "")
+    if summary in groups:
+        p, e, c = groups[summary]
+        groups[summary] = (p, e, c + 1)
+    else:
+        groups[summary] = (pid, etime, 1)
+
+for summary, (pid, etime, count) in groups.items():
+    suffix = f" (+{count - 1} workers)" if count > 1 else ""
+    print(f"  {pid:>8} {etime:>10}  {summary}{suffix}")
+PYEOF
+}
+
+# ── Read input ────────────────────────────────────────────────────────────
+# Read stdin with a 1s timeout to avoid hanging when the Bash tool invokes
+# us without piping anything (terminal-attached case). If stdin is a pipe
+# but no data arrives in 1s, treat it as empty.
+#
+# We use `read -t 1` (bash builtin, no PATH dependency) instead of
+# `timeout 1 cat` so the script still works in degraded environments
+# (e.g. hook with restricted PATH). Fall back to plain read if -t unsupported.
+INPUT=""
+if [[ ! -t 0 ]]; then
+    if read -t 1 -r INPUT; then
+        : # got one line; try to read more without blocking
+        while read -t 0.1 -r line 2>/dev/null; do
+            INPUT="$INPUT"$'\n'"$line"
+        done
+    fi
+fi
+
+# Extract the command field if we got JSON
+CMD=""
+if [[ "$INPUT" == *'"tool_input"'* ]] || [[ "$INPUT" == *'"command"'* ]]; then
+    CMD="$(echo "$INPUT" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("tool_input", {}).get("command", "") or d.get("command", ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+else
+    # Direct invocation: take args as the command, stripping redirects
+    CMD="$(strip_redirect_residue "$@")"
+fi
+
+[[ -n "$CMD" ]] || exit 0
+
+# ── Check for destructive patterns ────────────────────────────────────────
+# Use bash regex matching if grep is unavailable (degraded PATH).
+matches_destructive() {
+    local cmd="$1"
+    if command -v grep >/dev/null 2>&1; then
+        echo "$cmd" | grep -qE "$DESTRUCTIVE_RE"
+    else
+        # Bash =~ is ERE-like but lacks \b. Use (^|[^a-zA-Z]) as boundary.
+        [[ "$cmd" =~ (tmux\ +kill-(session|server|window|pane)|tmux_scheduler\.py\ +--stop) ]]
+    fi
+}
+
+if matches_destructive "$CMD"; then
+    WARNING="⚠️  DESTRUCTIVE TMUX OPERATION DETECTED
+
+Command: $CMD
+
+This will likely kill ALL processes in the tmux session(s)."
+
+    if command -v tmux >/dev/null && tmux ls >/dev/null 2>&1; then
+        WARNING="$WARNING
+
+Detected TRAINING-like processes per session:
+"
+        FOUND_ANY=0
+        while IFS= read -r s; do
+            [[ -z "$s" ]] && continue
+            s="${s%%:*}"
+            # Get all descendants
+            DESC=$(session_descendants "$s" 2>/dev/null || true)
+            # Filter to training-like processes only (compact output)
+            TRAINING=$(echo "$DESC" | grep -E "$TRAINING_RE" 2>/dev/null || true)
+            if [[ -n "$TRAINING" ]]; then
+                FOUND_ANY=1
+                WARNING="$WARNING
+
+Session: $s
+Training processes that WILL be killed:"
+                # Write TRAINING to temp file (avoid heredoc+pipe conflict in
+                # format_training_summary)
+                tf=$(mktemp)
+                printf '%s\n' "$TRAINING" > "$tf"
+                SUMMARY=$(format_training_summary "$tf")
+                rm -f "$tf"
+                WARNING="$WARNING
+$SUMMARY"
+            fi
+        done < <(tmux ls 2>/dev/null)
+
+        if [[ "$FOUND_ANY" == "1" ]]; then
+            WARNING="$WARNING
+
+If these are mid-training (hours of progress), killing them will lose work.
+Consider using tmux-restart-pane <target> -- <cmd> to restart ONLY the
+scheduler/monitor pane while keeping GPU panes alive.
+"
+        else
+            WARNING="$WARNING
+
+No training-like processes detected in any session —
+it is probably safe to proceed, but verify manually with tmux-status --procs.
+"
+        fi
+    fi
+
+    # Emit Claude Code hook protocol for "ask the user"
+    if [[ "$INPUT" == *'"tool_input"'* ]] || [[ "$INPUT" == *'"command"'* ]]; then
+        cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "ask",
+    "permissionDecisionReason": $(echo "$WARNING" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+  }
+}
+EOF
+    else
+        echo "$WARNING" >&2
+    fi
+    exit 0
+fi
+
+exit 0
