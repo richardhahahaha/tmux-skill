@@ -1,28 +1,28 @@
 ---
 name: tmux-control
-version: 1.1.6
+version: 2.0.0
 description: |
-  Safe tmux pane operations for Claude Code: send commands, restart individual
-  panes without killing others, inspect state. Built to dodge the multi-line
-  shell-mangling bug that occurs when Claude Code's Bash tool pipes commands
-  through tmux send-keys. Use when you need to: operate on a tmux session,
-  restart a scheduler/monitor while preserving training panes, inspect what's
-  running in each pane, or safely send a command to a specific pane. Use when
-  asked to "restart tmux", "send command to tmux", "check tmux status", or
-  "restart scheduler without killing training".
+  Safe, general-purpose tmux pane operations for Claude Code: inspect sessions,
+  send commands, restart individual panes without killing others, and guard
+  against destructive kills. Built to dodge the multi-line shell-mangling bug
+  that occurs when Claude Code's Bash tool pipes commands through tmux
+  send-keys. Protects long-running jobs (training, servers, workers) via a
+  configurable PROTECTED_RE. Use when asked to "send command to tmux",
+  "restart tmux pane", "check tmux status", "kill tmux pane/session safely",
+  or when operating any long-running process inside tmux.
 triggers:
   - tmux
-  - restart pane
-  - send command to pane
-  - restart scheduler
   - tmux status
+  - send command to pane
+  - restart pane
+  - kill pane
   - kill session guard
 allowed-tools:
   - Bash
   - Read
 ---
 
-# tmux-control — Safe tmux pane operations
+# tmux-control — Safe, general-purpose tmux pane operations
 
 ## Why this skill exists
 
@@ -31,7 +31,7 @@ flow through `tmux send-keys`. The target pane's shell ends up running garbage
 like:
 
 ```
-$ sleep1tmuxsend-keys-tpalm_training_agent:scheduler
+$ sleep1tmuxsend-keys-tmysession:scheduler
 bash: sleep1tmuxsend-keys...: command not found
 ```
 
@@ -50,6 +50,27 @@ This skill routes every tmux send through a helper that:
 3. **Always captures pane output to a file**, not stdout — sidesteps the
    broken `| tail -n N` parsing.
 
+Additionally, every destructive path (kill pane / kill session) is guarded by
+a configurable **PROTECTED_RE** so long-running jobs are not silently lost.
+
+## Configuration (make it yours)
+
+All scripts source `~/.claude/skills/tmux-control/config`. Edit it once per
+machine/project:
+
+```bash
+# Which processes count as "long-running / important" (ERE):
+PROTECTED_RE='train\.py|trainer|scheduler|monitor|jupyter|serve|uvicorn|celery|worker'
+
+# What `tmux-status --procs` lists:
+PROCS_RE="python|node|$PROTECTED_RE"
+
+# Extra destructive command patterns your project uses (optional):
+# EXTRA_DESTRUCTIVE_RE='myscript\.py\s+--stop\b'
+```
+
+Env override without editing the file: `TMUX_CONTROL_PROTECTED_RE='...'`.
+
 ## The five scripts
 
 All scripts live in `~/.claude/skills/tmux-control/bin/`. They are safe to
@@ -67,9 +88,9 @@ Bash tool even when the call picks up trailing redirect tokens. (Bare `1` /
 ~/.claude/skills/tmux-control/bin/tmux-status
 
 # One session + last 5 lines per pane
-~/.claude/skills/tmux-control/bin/tmux-status palm_training_agent --tail 5
+~/.claude/skills/tmux-control/bin/tmux-status myproj --tail 5
 
-# Include matching python/training processes
+# Include protected/python processes
 ~/.claude/skills/tmux-control/bin/tmux-status --procs
 ```
 
@@ -83,14 +104,14 @@ This is the **default way to send a command**. Never use raw
 
 ```bash
 # Simple command
-~/.claude/skills/tmux-control/bin/tmux-exec palm_training_agent:scheduler \
-    'python tmux_scheduler.py --loop --interval 60'
+~/.claude/skills/tmux-control/bin/tmux-exec myproj:scheduler \
+    'python scheduler.py --loop --interval 60'
 
 # Multi-line command via stdin
-~/.claude/skills/tmux-control/bin/tmux-exec palm_training_agent:monitor --stdin <<'EOF'
+~/.claude/skills/tmux-control/bin/tmux-exec myproj:worker --stdin <<'EOF'
 source .venv/bin/activate
-cd /cache/richard/work/palm-agent
-python tmux_scheduler.py --monitor-loop
+cd /path/to/project
+python worker.py --loop
 EOF
 
 # With cwd, longer wait, more output captured
@@ -103,28 +124,28 @@ Options: `--cwd`, `--wait <sec>` (default 3), `--lines <n>` (default 20),
 
 ### 3. `tmux-restart-pane` — stop a process in one pane and restart it
 
-The killer feature: restart the scheduler/monitor pane while GPU training
-panes keep running. **Do not use `tmux_scheduler.py --stop`** when GPUs are
-busy — it kills the whole session.
+The killer feature: restart one pane (scheduler, worker, dev server) while
+all other panes — and their long-running jobs — keep running. Never kill the
+whole session just to reload one pane.
 
 ```bash
 # Dry run — see what would be sent and which panes would be verified
 ~/.claude/skills/tmux-control/bin/tmux-restart-pane \
-    palm_training_agent:scheduler --dry-run -- \
-    python tmux_scheduler.py --loop --interval 60
+    myproj:scheduler --dry-run -- \
+    python scheduler.py --loop --interval 60
 
-# Restart scheduler in place
+# Restart a worker in place
 ~/.claude/skills/tmux-control/bin/tmux-restart-pane \
-    palm_training_agent:scheduler -- \
-    python tmux_scheduler.py --loop --interval 60
+    myproj:worker -- \
+    python worker.py --loop
 
-# Restart monitor, verify GPU panes are still alive afterward
+# Restart scheduler, verify other panes are still alive afterward
 ~/.claude/skills/tmux-control/bin/tmux-restart-pane \
-    palm_training_agent:monitor \
-    --verify palm_training_agent:gpu0 \
-    --verify palm_training_agent:gpu1 \
-    --verify palm_training_agent:gpu4 -- \
-    python tmux_scheduler.py --monitor-loop
+    myproj:scheduler \
+    --verify myproj:gpu0 \
+    --verify myproj:gpu1 \
+    --verify myproj:api -- \
+    python scheduler.py --loop --interval 60
 ```
 
 What it does:
@@ -149,8 +170,9 @@ stable → false "dead").
 ### 4. `check-tmux-destructive` — guard against accidental mass kill
 
 A PreToolUse hook that blocks `tmux kill-session`, `tmux kill-server`,
-`tmux kill-window`, `tmux kill-pane`, `tmux_scheduler.py --stop`, and similar
-commands when training processes are detected in any tmux session. To install:
+`tmux kill-window`, `tmux kill-pane`, plus any `EXTRA_DESTRUCTIVE_RE` patterns
+from `config`, when protected processes are detected in any tmux session. To
+install:
 
 ```json
 // ~/.claude/settings.json
@@ -168,21 +190,43 @@ commands when training processes are detected in any tmux session. To install:
 ```
 
 When triggered, returns `permissionDecision: "ask"` with a warning that
-lists running training processes and suggests `tmux-restart-pane` instead.
+lists running protected processes and suggests `tmux-restart-pane` instead.
 
 **Per-session descendant mapping** (v1.1): walks the process tree from each
-tmux session's `#{pane_pid}` set, NOT global `ps`. Filters to training-like
-processes only (`clsTrainer`, `palm_train.sh`, `palm_det_train.sh`,
-`tmux_scheduler.py`, `DetTrainer`, `train.py`) so the dev shell session
+tmux session's `#{pane_pid}` set, NOT global `ps`. Filters to protected
+processes only (per `PROTECTED_RE` in `config`) so the dev shell session
 containing Claude Code / node / MCP servers doesn't drown out the warning.
 Identical worker processes (e.g. 4 dataloader workers per trainer) are
 collapsed to `+N workers` suffixes. Typical runtime: 0.3-0.5s.
 
 Direct invocation:
 ```bash
-~/.claude/skills/tmux-control/bin/check-tmux-destructive "python tmux_scheduler.py --stop"
+~/.claude/skills/tmux-control/bin/check-tmux-destructive "tmux kill-session -t myproj"
 # Prints warning to stderr, exit 0
 ```
+
+### 5. `tmux-kill-pane` — safe `kill-pane` with pre-flight check
+
+Refuses to kill a pane whose process tree contains protected processes (per
+`PROTECTED_RE` in `config`) unless you pass `--force`. Use this INSTEAD of
+raw `tmux kill-pane -t ...`.
+
+```bash
+# Refuses if a protected process is detected
+~/.claude/skills/tmux-control/bin/tmux-kill-pane myproj:gpu2
+
+# Kill anyway
+~/.claude/skills/tmux-control/bin/tmux-kill-pane myproj:gpu2 --force
+
+# Allow specific pattern (e.g. only kill if process matches 'worker.py')
+~/.claude/skills/tmux-control/bin/tmux-kill-pane myproj:worker --allow 'worker.py'
+
+# Preview without killing
+~/.claude/skills/tmux-control/bin/tmux-kill-pane myproj:gpu2 --dry-run
+```
+
+Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
+(protected process detected, use --force).
 
 ## Decision tree: which script do I need?
 
@@ -197,48 +241,25 @@ I need to...
 │       NEVER use raw `tmux send-keys` from Bash tool
 │
 ├─ ...restart a long-running process in one pane
-│   (e.g. load new code in scheduler while training continues)
+│   (e.g. load new code in a worker while other panes keep running)
 │   └─ tmux-restart-pane <target> [--verify <other_pane>] -- <command>
 │
 ├─ ...stop the whole session
-│   └─ ⚠️ STOP. Are there training processes running? Use tmux-status --procs.
-│      If yes: do NOT use --stop. Use tmux-restart-pane on the offending pane.
-│      The check-tmux-destructive hook should also catch this.
+│   └─ ⚠️ STOP. Are there long-running jobs? Use tmux-status --procs.
+│      If yes: do NOT kill the session. Use tmux-restart-pane on the
+│      offending pane. The check-tmux-destructive hook should also catch this.
 │
 ├─ ...kill a pane/window
 │   └─ tmux-kill-pane <target>
-│       Refuses if training-like processes are in the pane.
+│       Refuses if protected processes are in the pane.
 │       Use --force to override, --allow '<pattern>' to allowlist.
 │       Use --dry-run to preview.
 │
 └─ ...mass-stop the whole session / kill-server
-    └─ ⚠️ STOP. Are there training processes running? Use tmux-status --procs.
-       If yes: do NOT use --stop. Use tmux-restart-pane on the offending pane.
+    └─ ⚠️ STOP. Are there long-running jobs? Use tmux-status --procs.
+       If yes: do NOT kill. Use tmux-restart-pane on the offending pane.
        The check-tmux-destructive hook should also catch this.
 ```
-
-### 5. `tmux-kill-pane` — safe `kill-pane` with pre-flight check
-
-Refuses to kill a pane whose process tree contains training-like processes
-(`clsTrainer`, `palm_train.sh`, `tmux_scheduler.py`, etc.) unless you pass
-`--force`. Use this INSTEAD of raw `tmux kill-pane -t ...`.
-
-```bash
-# Refuses if training detected
-~/.claude/skills/tmux-control/bin/tmux-kill-pane palm_training_agent:gpu4
-
-# Kill anyway
-~/.claude/skills/tmux-control/bin/tmux-kill-pane palm_training_agent:gpu4 --force
-
-# Allow specific pattern (e.g. only kill if process matches 'clsTrainer')
-~/.claude/skills/tmux-control/bin/tmux-kill-pane palm_training_agent:gpu4 --allow 'clsTrainer'
-
-# Preview without killing
-~/.claude/skills/tmux-control/bin/tmux-kill-pane palm_training_agent:gpu4 --dry-run
-```
-
-Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
-(training detected, use --force).
 
 ## Hard-won lessons (do not repeat)
 
@@ -247,7 +268,7 @@ Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
    result back to the target pane. Always write output to a file, then cat.
 
 2. **Do NOT use `printf '%q'` to quote args for tmux send-keys / paste-buffer.**
-   `printf '%q'` produces shell-escape sequences like `python\ tmux_scheduler.py`
+   `printf '%q'` produces shell-escape sequences like `python\ foo.py`
    (with literal backslashes). When pasted via `tmux paste-buffer`, the target
    shell sees those backslashes as literal characters and the command becomes
    garbage. Use plain `"${CMD_ARGS[*]}"` (space-joined) — Claude Code's Bash
@@ -265,15 +286,15 @@ Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
    that garbage. Use the full sequence: `C-c` → `C-u` → `Enter` → `C-u`.
    `tmux-exec` does this for you.
 
-5. **`tmux_scheduler.py --stop` is a sledgehammer.** It marks every running
-   experiment as `failed` with reason `scheduler_stopped`, THEN kills the
-   tmux session. You lose hours of GPU training. Only use when no GPUs are
-   busy. Always check with `tmux-status --procs` first.
+5. **Whole-session stop scripts are sledgehammers.** Any project script that
+   "stops everything" (kills the tmux session) will mark running jobs dead
+   and lose hours of work. Only use when no long-running jobs are active.
+   Always check with `tmux-status --procs` first, and register such scripts
+   in `EXTRA_DESTRUCTIVE_RE` so the hook warns about them.
 
-6. **Identifying "the scheduler pane" requires capturing it.** Window names
+6. **Identifying "which pane runs X" requires capturing it.** Window names
    can lie (an `attach` followed by `cd` doesn't rename the window). Use
-   `tmux-status <session> --tail 5` and look for `[SCHEDULE]` /
-   `[ MONITORING ]` / iteration markers.
+   `tmux-status <session> --tail 5` and look at the pane contents.
 
 7. **`tmux list-panes` over a window without panes returns the window's
    implicit single pane.** `tmux-status` handles this; manual code often
@@ -322,11 +343,11 @@ Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
     the bash pipe-stderr operator. Always single-quote each alternative:
     `'2>&1'|'>'|'1>'|'2>'|'&>'`.
 
-15. **Filter to training-like processes when warning about kills.** A dev
+15. **Filter to protected processes when warning about kills.** A dev
     tmux session containing Claude Code / node / MCP servers easily has 30+
     descendants; warning about all of them drowns out the real concern.
-    Filter to `clsTrainer`, `palm_train.sh`, `tmux_scheduler.py`, etc. and
-    collapse identical worker commands via `+N workers` suffixes.
+    Filter via `PROTECTED_RE` in `config` and collapse identical worker
+    commands via `+N workers` suffixes.
 
 16. **`tmux-status` must exit non-zero when a named session is not found.**
     Originally it printed "(not found)" to the report file but exited 0,
@@ -345,11 +366,11 @@ Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
     Otherwise the hook silently fails to detect destructive commands.
 
 18. **`tmux kill-window` is just as destructive as `kill-session`.**
-    A window contains panes, each of which may have training processes.
+    A window contains panes, each of which may have long-running jobs.
     The original `DESTRUCTIVE_RE` only matched `kill-(session|server)` and
     `kill-pane`, missing `kill-window` entirely. This meant
-    `tmux kill-window -t session:gpu0` would bypass the hook and silently
-    kill GPU training. Fixed in v1.1.2: regex now matches
+    `tmux kill-window -t session:win0` would bypass the hook and silently
+    kill running jobs. Fixed in v1.1.2: regex now matches
     `kill-(session|server|window|pane)`. Always include ALL tmux kill
     subcommands in destructive-pattern checks.
 
@@ -378,13 +399,12 @@ Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
     `[[ "$var" =~ ^[0-9]+$ ]]` provides a second layer of defense.
     Always use `[[ $# -ge 2 && "$2" != -* ]]` for flag-value guards.
 
-21. **TRAINING_RE must be kept in sync across scripts.**
-    `check-tmux-destructive` and `tmux-kill-pane` both define
-    `TRAINING_RE` to identify training-like processes. A duplicate
-    `clsTrainer` entry in one script's regex was harmless (regex `|`
-    tolerates duplicates) but violated the "must match" comment. Fixed
-    in v1.1.4. When two scripts share a pattern constant, keep them
-    byte-identical or extract to a shared file.
+21. **PROTECTED_RE must be kept in sync across scripts.**
+    `check-tmux-destructive` and `tmux-kill-pane` both need the
+    protected-process pattern. Duplicated constants drift. Since v2.0.0,
+    both scripts source the shared `../config` file — do NOT inline the
+    pattern in scripts anymore. When two scripts share a constant, extract
+    it to a shared file.
 
 22. **The `-*|--` case branch eats legitimate command flags.**
     In `tmux-exec`, the parse loop had a `-*|--` branch to swallow
@@ -426,46 +446,61 @@ Exit codes: 0=killed (or dry-run), 2=usage, 3=target not found, 6=refused
     (preserve it). If you need a literal redirect in the command, use
     `tmux-exec --file` or `--stdin` instead.
 
+24. **Keep project specifics in `config`, not in script code.** v1.x
+    hardcoded training patterns (`clsTrainer`, `palm_train.sh`,
+    `tmux_scheduler.py --stop`) across four scripts. Every new project
+    meant editing five files. v2.0.0 moved all project-specific regexes
+    into `~/.claude/skills/tmux-control/config` (with env-var overrides).
+    When a skill is generically useful, the ONLY thing that should change
+    per project is configuration.
+
+25. **A pane's job may BE the pane_pid, not a child.** v1.x process-tree
+    walks started at tmux `#{pane_pid}` and printed only DESCENDANTS. But
+    when a pane is created as `tmux new-session -d 'python train.py'`, the
+    shell execs into python, so pane_pid IS the job and the "tree" is
+    empty — `tmux-kill-pane` reported "idle shell" and killed a live job,
+    and `check-tmux-destructive` warned "no protected processes". Fixed in
+    v2.0.0: the kill-guard and destructive-guard walks now include the root
+    pane_pid itself. `tmux-restart-pane` intentionally does NOT include it
+    in its stop-wait loop (after C-c the shell must remain, or the loop
+    would never see an "empty" pane), but its `--verify` stage now reports
+    a vanished pane as a death instead of silently passing.
+
 ## Common workflows
 
-### Workflow A: Restart scheduler/monitor after code change
+### Workflow A: Restart one pane after a code change (others keep running)
 
 ```bash
 # 1. Check current state
-~/.claude/skills/tmux-control/bin/tmux-status palm_training_agent --tail 3 --procs
+~/.claude/skills/tmux-control/bin/tmux-status myproj --tail 3 --procs
 
-# 2. If GPUs are busy, restart ONLY the scheduler pane (preserve training)
+# 2. If other panes are busy, restart ONLY the pane you need
 ~/.claude/skills/tmux-control/bin/tmux-restart-pane \
-    palm_training_agent:scheduler \
-    --verify palm_training_agent:gpu0 \
-    --verify palm_training_agent:gpu1 \
-    --verify palm_training_agent:gpu4 -- \
-    python tmux_scheduler.py --loop --interval 60
+    myproj:scheduler \
+    --verify myproj:gpu0 \
+    --verify myproj:gpu1 \
+    --verify myproj:api -- \
+    python scheduler.py --loop --interval 60
 
-# 3. Same for monitor
-~/.claude/skills/tmux-control/bin/tmux-restart-pane \
-    palm_training_agent:monitor -- \
-    python tmux_scheduler.py --monitor-loop
-
-# 4. Confirm
-~/.claude/skills/tmux-control/bin/tmux-status palm_training_agent --tail 8 --procs
+# 3. Confirm
+~/.claude/skills/tmux-control/bin/tmux-status myproj --tail 8 --procs
 ```
 
 ### Workflow B: Stop everything cleanly
 
 ```bash
-# 1. Are there trainings? List them.
+# 1. Any long-running jobs? List them.
 ~/.claude/skills/tmux-control/bin/tmux-status --procs
 
-# 2. If no trainings, safe to stop:
-tmux kill-session -t palm_training_agent
+# 2. If nothing important is running, safe to stop:
+tmux kill-session -t myproj
 
 # 3. If yes — either wait, or explicitly decide to lose progress.
 #    The check-tmux-destructive hook will intercept this and require
 #    confirmation.
 
-# 4. To kill ONE pane (refuses if training is in it):
-~/.claude/skills/tmux-control/bin/tmux-kill-pane palm_training_agent:gpu7
+# 4. To kill ONE pane (refuses if a protected process is in it):
+~/.claude/skills/tmux-control/bin/tmux-kill-pane myproj:worker
 #   Add --force if you really mean it.
 ```
 
@@ -474,8 +509,8 @@ tmux kill-session -t palm_training_agent
 ```bash
 # Read a config value, check a process, etc — without leaving the pane
 # in a weird state
-~/.claude/skills/tmux-control/bin/tmux-exec palm_training_agent:gpu0 \
-    'tail -n 5 logs/exp123/train.log'
+~/.claude/skills/tmux-control/bin/tmux-exec myproj:api \
+    'tail -n 5 logs/app.log'
 ```
 
 (Though usually you'd just `Read` the log file directly — this is for when

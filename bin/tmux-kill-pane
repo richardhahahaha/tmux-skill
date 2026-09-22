@@ -1,6 +1,6 @@
 #!/bin/bash
 # tmux-kill-pane — safely kill a tmux pane, refusing (or asking) if the pane
-# has long-running training processes that would be lost.
+# has long-running protected processes that would be lost.
 #
 # This is the "kill" counterpart to tmux-restart-pane. Whereas restart-pane
 # replaces a process with a new one, kill-pane is for tearing down a pane
@@ -8,34 +8,37 @@
 #
 # WHY THIS EXISTS
 #   Plain `tmux kill-pane -t target` silently destroys whatever was running
-#   in that pane — including, in PALM-land, a 5-hour training run. This
-#   wrapper refuses to kill a pane whose process tree contains training-like
-#   processes (clsTrainer, palm_train.sh, tmux_scheduler.py, etc.) unless
-#   you pass --force.
+#   in that pane — including a multi-hour training job or a live server.
+#   This wrapper refuses to kill a pane whose process tree contains
+#   protected processes (see ../config PROTECTED_RE) unless you pass
+#   --force.
 #
 # USAGE
-#   tmux-kill-pane <target>                  # refuse if training detected
+#   tmux-kill-pane <target>                  # refuse if protected proc found
 #   tmux-kill-pane <target> --force          # kill anyway
 #   tmux-kill-pane <target> --dry-run        # show what would happen
 #   tmux-kill-pane <target> --allow <pat>    # allow kill if pattern matches
-#                                            # (e.g. --allow 'clsTrainer')
+#                                            # (e.g. --allow 'train.py')
 #
 # EXIT CODES
 #   0  Killed (or dry-run)
 #   2  Usage error
 #   3  Target not found
-#   6  Refused: training-like processes detected (use --force)
+#   6  Refused: protected processes detected (use --force)
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Load user config (if/then form: `[[ ]] &&` would trip set -e) ─────────
+CONFIG_FILE="${SCRIPT_DIR}/../config"
+if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
+PROTECTED_RE="${TMUX_CONTROL_PROTECTED_RE:-${PROTECTED_RE:-train\\.py|trainer|scheduler|monitor}}"
+
 TARGET=""
 FORCE=0
 DRY_RUN=0
 ALLOW_PATTERNS=()
-
-# Training-like process patterns (must match check-tmux-destructive)
-TRAINING_RE='clsTrainer|palm_train\.sh|palm_det_train\.sh|tmux_scheduler\.py|train\.py|DetTrainer'
 
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
@@ -79,7 +82,11 @@ if ! tmux list-panes -t "$TARGET" >/dev/null 2>&1; then
     exit 3
 fi
 
-# ── Helper: walk process tree from the pane's shell pid ───────────────────
+# ── Helper: walk process tree from the pane's shell pid (INCLUDES the
+# pane_pid itself: when a pane is started as `tmux new-session -d
+# 'python train.py'`, the shell execs into python and pane_pid IS the job;
+# children-only walks report an empty tree and the kill guard silently
+# passes. v2.0.0 fix) ───────────────────
 descendants_of_pane() {
     local pane_target="$1"
     local pane_pid
@@ -95,6 +102,7 @@ import sys
 root = int(sys.argv[1])
 psfile = sys.argv[2]
 children = {}
+info = {}
 with open(psfile) as f:
     for line in f:
         parts = line.split(None, 3)
@@ -104,16 +112,19 @@ with open(psfile) as f:
             pid, ppid = int(parts[0]), int(parts[1])
         except ValueError:
             continue
-        children.setdefault(ppid, []).append((pid, parts[2], parts[3].rstrip()))
+        info[pid] = (parts[2], parts[3].rstrip())
+        children.setdefault(ppid, []).append(pid)
+
+root_info = info.get(root)
+if root_info:
+    print(f"{root} {root_info[0]} {root_info[1]}")
 
 queue = [root]
-seen = set()
+seen = {root}
 while queue:
     cur = queue.pop(0)
-    if cur in seen:
-        continue
-    seen.add(cur)
-    for pid, etime, args in children.get(cur, []):
+    for pid in children.get(cur, []):
+        etime, args = info.get(pid, ("?", ""))
         print(f"{pid} {etime} {args}")
         queue.append(pid)
 PYEOF
@@ -122,11 +133,11 @@ PYEOF
 
 # ── Pre-flight: check what's running in the pane ─────────────────────────
 DESC=$(descendants_of_pane "$TARGET" || true)
-TRAINING_IN_PANE=$(echo "$DESC" | grep -E "$TRAINING_RE" 2>/dev/null || true)
+PROTECTED_IN_PANE=$(echo "$DESC" | grep -E "$PROTECTED_RE" 2>/dev/null || true)
 
-# Apply --allow patterns (if any training process matches an allow pattern,
+# Apply --allow patterns (if any protected process matches an allow pattern,
 # we treat it as user-approved and skip the refusal).
-if [[ -n "$TRAINING_IN_PANE" && ${#ALLOW_PATTERNS[@]} -gt 0 ]]; then
+if [[ -n "$PROTECTED_IN_PANE" && ${#ALLOW_PATTERNS[@]} -gt 0 ]]; then
     FILTERED=""
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -138,8 +149,8 @@ if [[ -n "$TRAINING_IN_PANE" && ${#ALLOW_PATTERNS[@]} -gt 0 ]]; then
             fi
         done
         [[ "$MATCHED" == "1" ]] || FILTERED+="$line"$'\n'
-    done <<< "$TRAINING_IN_PANE"
-    TRAINING_IN_PANE="$FILTERED"
+    done <<< "$PROTECTED_IN_PANE"
+    PROTECTED_IN_PANE="$FILTERED"
 fi
 
 echo "[kill-pane] target=$TARGET"
@@ -154,20 +165,20 @@ fi
 if [[ "$DRY_RUN" == "1" ]]; then
     echo ""
     echo "[kill-pane] DRY RUN — would run: tmux kill-pane -t $TARGET"
-    if [[ -n "$TRAINING_IN_PANE" ]]; then
-        echo "[kill-pane] DRY RUN — WARNING: training processes would be killed:"
-        echo "$TRAINING_IN_PANE" | head -5 | sed 's/^/    /' | cut -c1-160
+    if [[ -n "$PROTECTED_IN_PANE" ]]; then
+        echo "[kill-pane] DRY RUN — WARNING: protected processes would be killed:"
+        echo "$PROTECTED_IN_PANE" | head -5 | sed 's/^/    /' | cut -c1-160
     fi
     exit 0
 fi
 
-if [[ -n "$TRAINING_IN_PANE" && "$FORCE" != "1" ]]; then
+if [[ -n "$PROTECTED_IN_PANE" && "$FORCE" != "1" ]]; then
     echo ""
-    echo "[kill-pane] REFUSED: training-like processes detected in pane:"
-    echo "$TRAINING_IN_PANE" | head -5 | sed 's/^/    /' | cut -c1-160
+    echo "[kill-pane] REFUSED: protected processes detected in pane:"
+    echo "$PROTECTED_IN_PANE" | head -5 | sed 's/^/    /' | cut -c1-160
     echo ""
     echo "[kill-pane] To proceed anyway: tmux-kill-pane $TARGET --force"
-    echo "[kill-pane] Or to allow specific patterns: tmux-kill-pane $TARGET --allow 'clsTrainer'"
+    echo "[kill-pane] Or to allow specific patterns: tmux-kill-pane $TARGET --allow 'train.py'"
     exit 6
 fi
 

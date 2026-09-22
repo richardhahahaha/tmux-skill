@@ -1,0 +1,20 @@
+# tmux-control — user configuration
+# Sourced by every script in bin/. Edit this file to adapt the skill to your
+# project. Environment variable TMUX_CONTROL_PROTECTED_RE overrides PROTECTED_RE.
+
+# PROTECTED_RE — ERE matched against process command lines. Processes matching
+# this pattern are considered "long-running / important":
+#   - tmux-kill-pane refuses to kill panes containing them (unless --force)
+#   - check-tmux-destructive lists them in warnings before kill-session etc.
+#   - tmux-status --procs shows them (together with any python process)
+# Keep this project-specific; the defaults below cover common long-running jobs.
+PROTECTED_RE='train\.py|trainer|scheduler|monitor|jupyter|serve|uvicorn|gunicorn|celery|streamlit|worker|daemon'
+
+# PROCS_RE — pattern used by `tmux-status --procs` when listing processes.
+PROCS_RE="python|node|$PROTECTED_RE"
+
+# EXTRA_DESTRUCTIVE_RE (optional) — additional command patterns that
+# check-tmux-destructive should treat as destructive, e.g. your project's
+# whole-session stop script:
+# EXTRA_DESTRUCTIVE_RE='myscript\.py\s+--stop\b'
+EXTRA_DESTRUCTIVE_RE="${EXTRA_DESTRUCTIVE_RE:-}"

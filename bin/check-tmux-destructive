@@ -6,10 +6,10 @@
 #
 # WHEN USED AS A HOOK
 #   Reads the bash command from Claude Code's hook input JSON (on stdin).
-#   Looks for patterns like `tmux kill-session`, `tmux kill-window`,
-#   `tmux_scheduler.py --stop`, etc.
+#   Looks for patterns like `tmux kill-session`, `tmux kill-window`, plus any
+#   EXTRA_DESTRUCTIVE_RE from ../config (e.g. your project's `--stop` script).
 #   If matched, returns permissionDecision: "ask" with a warning that lists
-#   running TRAINING-like processes in each tmux session.
+#   running protected processes in each tmux session.
 #
 # WHEN CALLED DIRECTLY
 #   tmux-restart-pane and other helpers call this before doing anything.
@@ -27,26 +27,39 @@
 #     }
 #
 # USAGE (direct)
-#   check-tmux-destructive "python tmux_scheduler.py --stop"
-#   check-tmux-destructive --session palm_training_agent "rm -rf logs/"
+#   check-tmux-destructive "tmux kill-session -t mysession"
+#   check-tmux-destructive --session mysession "rm -rf logs/"
+#
+# CONFIGURATION
+#   ../config defines PROTECTED_RE (which processes are worth warning about)
+#   and EXTRA_DESTRUCTIVE_RE (project-specific destructive commands).
+#   TMUX_CONTROL_PROTECTED_RE env var overrides PROTECTED_RE.
 #
 # PERFORMANCE NOTES
-#   We only emit TRAINING-like processes (clsTrainer, palm_train.sh,
-#   tmux_scheduler.py, palm_det_train.sh, etc.) — NOT every long-running
-#   descendant. This keeps the warning compact even when session `0` contains
-#   the user's dev shell with Claude Code, happy, node, MCP servers, etc.
-#   We also collapse duplicate worker processes from the same parent (e.g.
-#   python -m zlearning.clsTrainer workers forked by the same trainer).
+#   We only emit protected processes (per PROTECTED_RE) — NOT every
+#   long-running descendant. This keeps the warning compact even when a
+#   session contains the user's dev shell with Claude Code, node, MCP
+#   servers, etc. We also collapse duplicate worker processes from the same
+#   parent (e.g. dataloader workers forked by the same trainer).
 #
 set -euo pipefail
 
-# Patterns that destroy entire tmux sessions, windows, or kill panes.
-# Flag any `tmux kill-session/server/window/pane` invocation. (We accept rare
-# false positives on `--help`; safer to over-warn than miss a real kill.)
-DESTRUCTIVE_RE='tmux\s+kill-(session|server|window|pane)\b|tmux_scheduler\.py\s+--stop\b'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Patterns identifying training-related processes (the user's actual concern)
-TRAINING_RE='clsTrainer|palm_train\.sh|palm_det_train\.sh|tmux_scheduler\.py|train\.py|DetTrainer'
+# ── Load user config ──────────────────────────────────────────────────────
+# (if/then form: `[[ ]] &&` would trip set -e when the file is absent)
+CONFIG_FILE="${SCRIPT_DIR}/../config"
+if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
+PROTECTED_RE="${TMUX_CONTROL_PROTECTED_RE:-${PROTECTED_RE:-train\\.py|trainer|scheduler|monitor}}"
+
+# Patterns that destroy entire tmux sessions, windows, or kill panes.
+# Flag any `tmux kill-session/server/window/pane` invocation, plus any
+# project-specific destructive commands from config. (We accept rare false
+# positives on `--help`; safer to over-warn than miss a real kill.)
+DESTRUCTIVE_RE='tmux\s+kill-(session|server|window|pane)\b'
+if [[ -n "$EXTRA_DESTRUCTIVE_RE" ]]; then
+    DESTRUCTIVE_RE="$DESTRUCTIVE_RE|$EXTRA_DESTRUCTIVE_RE"
+fi
 
 # ── Helper: strip obvious shell redirect residue from args ────────────────
 # Claude Code's Bash tool sometimes passes trailing tokens like `2`, `&`,
@@ -109,14 +122,19 @@ with open(psfile) as f:
         children.setdefault(ppid, []).append(pid)
         pid_to_info[pid] = (etime, args)
 
+# The pane_pid itself counts too: when a pane was started directly as
+# `tmux new-session -d 'python train.py'`, the shell execs into python and
+# pane_pid IS the job — children-only walks would miss it. (v2.0.0 fix)
+for r in roots:
+    if r in pid_to_info:
+        etime, args = pid_to_info[r]
+        print(f"{r} {etime} {args}")
+
 # BFS walk
 queue = list(roots)
-seen = set()
+seen = set(roots)
 while queue:
     cur = queue.pop(0)
-    if cur in seen:
-        continue
-    seen.add(cur)
     for pid in children.get(cur, []):
         etime, args = pid_to_info.get(pid, ("?", ""))
         print(f"{pid} {etime} {args}")
@@ -125,15 +143,15 @@ PYEOF
     rm -f "$psfile"
 }
 
-# ── Helper: format a single training process line for the warning ────────
+# ── Helper: format a single protected process line for the warning ────────
 # Truncate the (often huge) command line intelligently:
-#   - python -m zlearning.clsTrainer --train-sample ... --name opt_0727_111117_gpu1 --backbone ...
+#   - python -m mypkg.trainer --train-sample ... --name exp_0727_gpu1 --backbone ...
 # becomes roughly:
-#   python -m zlearning.clsTrainer ... [opt_0727_111117_gpu1] (55:43)
+#   python -m mypkg.trainer ... [exp_0727_gpu1] (55:43)
 # We do this in python for clarity.
 # Note: takes input via argv-passed temp file path, NOT stdin (heredoc+pipe
 # conflict — same lesson as session_descendants above).
-format_training_summary() {
+format_protected_summary() {
     local infile="$1"
     python3 - "$infile" <<'PYEOF'
 import sys
@@ -155,9 +173,9 @@ for line in lines:
     if len(parts) < 3:
         continue
     pid, etime, args = parts
-    # Use the LAST --name occurrence: palm_train.sh appends the experiment
-    # name after the trainer's default --name palm, so the last one is the
-    # actual experiment identifier.
+    # Use the LAST --name occurrence: many CLIs take an experiment/run name
+    # via --name, and wrapper scripts may append it after their own default,
+    # so the last one is usually the actual identifier.
     names = re.findall(r'--name\s+(\S+)', args)
     name = names[-1] if names else ""
     head = " ".join(args.split()[:4])
@@ -221,7 +239,11 @@ matches_destructive() {
         echo "$cmd" | grep -qE "$DESTRUCTIVE_RE"
     else
         # Bash =~ is ERE-like but lacks \b. Use (^|[^a-zA-Z]) as boundary.
-        [[ "$cmd" =~ (tmux\ +kill-(session|server|window|pane)|tmux_scheduler\.py\ +--stop) ]]
+        [[ "$cmd" =~ (tmux\ +kill-(session|server|window|pane)) ]] && return 0
+        if [[ -n "$EXTRA_DESTRUCTIVE_RE" ]]; then
+            [[ "$cmd" =~ $EXTRA_DESTRUCTIVE_RE ]] && return 0
+        fi
+        return 1
     fi
 }
 
@@ -235,7 +257,7 @@ This will likely kill ALL processes in the tmux session(s)."
     if command -v tmux >/dev/null && tmux ls >/dev/null 2>&1; then
         WARNING="$WARNING
 
-Detected TRAINING-like processes per session:
+Detected PROTECTED processes per session (see ../config PROTECTED_RE):
 "
         FOUND_ANY=0
         while IFS= read -r s; do
@@ -243,19 +265,19 @@ Detected TRAINING-like processes per session:
             s="${s%%:*}"
             # Get all descendants
             DESC=$(session_descendants "$s" 2>/dev/null || true)
-            # Filter to training-like processes only (compact output)
-            TRAINING=$(echo "$DESC" | grep -E "$TRAINING_RE" 2>/dev/null || true)
-            if [[ -n "$TRAINING" ]]; then
+            # Filter to protected processes only (compact output)
+            PROTECTED=$(echo "$DESC" | grep -E "$PROTECTED_RE" 2>/dev/null || true)
+            if [[ -n "$PROTECTED" ]]; then
                 FOUND_ANY=1
                 WARNING="$WARNING
 
 Session: $s
-Training processes that WILL be killed:"
-                # Write TRAINING to temp file (avoid heredoc+pipe conflict in
-                # format_training_summary)
+Protected processes that WILL be killed:"
+                # Write PROTECTED to temp file (avoid heredoc+pipe conflict in
+                # format_protected_summary)
                 tf=$(mktemp)
-                printf '%s\n' "$TRAINING" > "$tf"
-                SUMMARY=$(format_training_summary "$tf")
+                printf '%s\n' "$PROTECTED" > "$tf"
+                SUMMARY=$(format_protected_summary "$tf")
                 rm -f "$tf"
                 WARNING="$WARNING
 $SUMMARY"
@@ -265,14 +287,14 @@ $SUMMARY"
         if [[ "$FOUND_ANY" == "1" ]]; then
             WARNING="$WARNING
 
-If these are mid-training (hours of progress), killing them will lose work.
-Consider using tmux-restart-pane <target> -- <cmd> to restart ONLY the
-scheduler/monitor pane while keeping GPU panes alive.
+If these are long-running jobs (hours of progress), killing them will lose
+work. Consider using tmux-restart-pane <target> -- <cmd> to restart ONLY the
+offending pane while keeping the other panes alive.
 "
         else
             WARNING="$WARNING
 
-No training-like processes detected in any session —
+No protected processes detected in any session —
 it is probably safe to proceed, but verify manually with tmux-status --procs.
 "
         fi

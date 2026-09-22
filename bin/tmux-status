@@ -8,10 +8,20 @@
 #   tmux-status                  # all sessions
 #   tmux-status <session>        # one session's windows/panes
 #   tmux-status <session> --tail N   # also show last N lines of each pane
-#   tmux-status --procs          # include matching python/bash processes
+#   tmux-status --procs          # include protected/python processes
 #   tmux-status --out <file>     # write to file (default: /tmp/tmux-status.txt)
 #
+# Process patterns come from ../config (PROCS_RE / PROTECTED_RE); override
+# with TMUX_CONTROL_PROTECTED_RE / TMUX_CONTROL_PROCS_RE env vars.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Load user config (if/then form: `[[ ]] &&` would trip set -e) ─────────
+CONFIG_FILE="${SCRIPT_DIR}/../config"
+if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
+PROTECTED_RE="${TMUX_CONTROL_PROTECTED_RE:-${PROTECTED_RE:-train\\.py|trainer|scheduler|monitor}}"
+PROCS_RE="${TMUX_CONTROL_PROCS_RE:-${PROCS_RE:-python|node|$PROTECTED_RE}}"
 
 SESSION=""
 TAIL=0
@@ -121,9 +131,9 @@ done
 
     if [[ "$PROCS" == "1" ]]; then
         echo ""
-        echo "[ MATCHING PROCESSES ]"
+        echo "[ MATCHING PROCESSES (pattern: $PROCS_RE) ]"
         ps -eo pid,etime,pcpu,args \
-            | grep -E 'python|clsTrainer\.py|palm_train\.sh|palm_det_train\.sh|tmux_scheduler\.py|web_monitor\.py|auto_monitor\.py' \
+            | grep -E "$PROCS_RE" \
             | grep -v grep || echo "(none)"
     fi
 

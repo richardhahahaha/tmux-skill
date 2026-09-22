@@ -3,12 +3,12 @@
 # and restart it with a new command, WITHOUT touching other panes.
 #
 # WHY THIS EXISTS
-#   When 3 trainings are running on GPUs and you need to restart only the
-#   scheduler pane (e.g. to pick up code changes), you can't use `--stop`
-#   which kills the whole tmux session. This script:
-#     1. Snapshots each --verify pane's process tree (via pane_pid + pgrep)
+#   When long-running jobs (training, servers, workers) are running in other
+#   panes and you need to restart only one pane (e.g. to pick up code
+#   changes), you can't kill the whole tmux session. This script:
+#     1. Snapshots each --verify pane's process tree (via pane_pid + ps)
 #     2. Sends C-c to the target pane only
-#     3. Waits for the python process to actually die
+#     3. Waits for the pane's process tree to actually empty
 #     4. Sends the new command via tmux-exec (atomic paste, no mangling)
 #     5. Re-snapshots each --verify pane and reports ANY descendant that died
 #
@@ -27,16 +27,15 @@
 #   tmux-restart-pane <target> --verify <protected-target> -- <command...>
 #
 # EXAMPLES
-#   # Restart scheduler in place
-#   tmux-restart-pane palm_training_agent:scheduler -- \
-#       python tmux_scheduler.py --loop --interval 60
+#   # Restart a worker in place
+#   tmux-restart-pane myproj:worker -- python worker.py --loop
 #
-#   # Restart monitor, verify GPU panes still alive afterward
-#   tmux-restart-pane palm_training_agent:monitor \
-#       --verify palm_training_agent:gpu0 \
-#       --verify palm_training_agent:gpu1 \
-#       --verify palm_training_agent:gpu4 -- \
-#       python tmux_scheduler.py --monitor-loop
+#   # Restart a scheduler, verify GPU panes still alive afterward
+#   tmux-restart-pane myproj:scheduler \
+#       --verify myproj:gpu0 \
+#       --verify myproj:gpu1 \
+#       --verify myproj:gpu2 -- \
+#       python scheduler.py --loop --interval 60
 #
 # EXIT CODES
 #   0  Success
@@ -250,6 +249,11 @@ if [[ ${#VERIFY_KEYS[@]} -gt 0 ]]; then
     sleep 3
     ALL_OK=1
     for p in "${VERIFY_KEYS[@]}"; do
+        if ! tmux list-panes -t "$p" >/dev/null 2>&1; then
+            echo "[restart-pane] WARNING: $p — pane no longer exists (its process tree died)"
+            ALL_OK=0
+            continue
+        fi
         AFTER_OUT="$(descendants_of_pane "$p" || true)"
         AFTER_PIDS=""
         while IFS= read -r line; do

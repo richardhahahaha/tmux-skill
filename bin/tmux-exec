@@ -33,8 +33,8 @@
 #   --dry-run         Print what would be sent, do not actually send
 #
 # EXAMPLES
-#   tmux-exec palm_training_agent:scheduler 'python tmux_scheduler.py --loop --interval 60'
-#   tmux-exec palm_training_agent:scheduler --dry-run -- python tmux_scheduler.py --loop
+#   tmux-exec myproj:scheduler 'python scheduler.py --loop --interval 60'
+#   tmux-exec myproj:scheduler --dry-run -- python scheduler.py --loop
 #
 set -euo pipefail
 
